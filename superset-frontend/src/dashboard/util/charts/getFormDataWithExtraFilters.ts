@@ -22,9 +22,11 @@ import {
   DataRecordFilters,
   DataRecordValue,
   ensureIsArray,
+  getColumnLabel,
   JsonObject,
   PartialFilters,
   ChartCustomization,
+  QueryFormColumn,
 } from '@superset-ui/core';
 import {
   ChartConfiguration,
@@ -33,7 +35,7 @@ import {
 } from 'src/dashboard/types';
 import { getExtraFormData } from 'src/dashboard/components/nativeFilters/utils';
 import { isChartCustomization } from 'src/dashboard/components/nativeFilters/FiltersConfigModal/utils';
-import { isEqual } from 'lodash';
+import { isEqual } from 'lodash-es';
 import { areObjectsEqual } from 'src/reduxUtils';
 import {
   isSingleColumnDimensionChart,
@@ -122,8 +124,13 @@ function extractColumnNames(columns: unknown[]): string[] {
     columns.forEach((col: unknown) => {
       if (typeof col === 'string') {
         columnNames.push(col);
-      } else if (col && typeof col === 'object' && 'column_name' in col) {
-        columnNames.push((col as { column_name: string }).column_name);
+      } else if (col && typeof col === 'object') {
+        if ('column_name' in col) {
+          columnNames.push((col as { column_name: string }).column_name);
+        } else if ('sqlExpression' in col) {
+          const label = getColumnLabel(col as QueryFormColumn);
+          if (label) columnNames.push(label);
+        }
       }
     });
   }
@@ -134,6 +141,7 @@ function buildExistingColumnsSet(chart: ChartQueryPayload): Set<string> {
   const existingColumns = new Set<string>();
   const chartType = chart.form_data?.viz_type;
 
+  // Base groupby is excluded: Dynamic Group By REPLACES it with the user's selection.
   const xAxisColumn = chart.form_data?.x_axis;
   if (xAxisColumn && chartType !== 'heatmap' && chartType !== 'heatmap_v2') {
     existingColumns.add(xAxisColumn);
@@ -279,7 +287,6 @@ function processGroupByCustomizations(
   >,
 ): {
   groupby?: string[];
-  order_by_cols?: string[];
   x_axis?: string;
   series?: string;
   columns?: string[];
@@ -297,8 +304,14 @@ function processGroupByCustomizations(
     return {};
   }
 
+  // ``form_data.datasource`` is encoded as ``<id>__<type>`` (e.g.
+  // ``7__table``, ``7__semantic_view``). Datasets and semantic views have
+  // independent ID spaces, so we have to compare both the numeric ID and the
+  // datasource type to avoid matching a semantic-view customization to a
+  // table chart that happens to share its numeric ID.
   const chartDatasetParts = String(chartDataset).split('__');
   const chartDatasetId = chartDatasetParts[0];
+  const chartDatasourceType = chartDatasetParts[1];
 
   const matchingCustomizations = chartCustomizationItems.filter(item => {
     if (item.removed) return false;
@@ -307,11 +320,20 @@ function processGroupByCustomizations(
     if (!targetDataset) return false;
 
     const targetDatasetId = String(targetDataset);
+    const targetDatasourceType = item.targets?.[0]?.datasourceType;
     const datasetMatches = chartDatasetId === targetDatasetId;
+    // ``datasourceType`` is optional on targets persisted before semantic
+    // views shipped, so a missing value on either side is treated as a
+    // wildcard match — this preserves behavior for pre-existing
+    // customizations while still disambiguating new ones.
+    const datasourceTypeMatches =
+      !targetDatasourceType ||
+      !chartDatasourceType ||
+      targetDatasourceType === chartDatasourceType;
     const chartMatches =
       item.chartsInScope == null || item.chartsInScope.includes(chart.id);
 
-    return datasetMatches && chartMatches;
+    return datasetMatches && datasourceTypeMatches && chartMatches;
   });
 
   const chartType = chart.form_data?.viz_type;
@@ -324,7 +346,6 @@ function processGroupByCustomizations(
   const xAxisColumn = chart.form_data?.x_axis;
 
   const groupByColumns: string[] = [];
-  let orderByConfig: string[] | undefined;
   let heatmapColumnAdded = false;
 
   matchingCustomizations.forEach(item => {
@@ -372,12 +393,6 @@ function processGroupByCustomizations(
         }
       });
     }
-
-    const sortMetric = item.controlValues?.sortMetric;
-    const sortAscending = item.controlValues?.sortAscending;
-    if (sortMetric) {
-      orderByConfig = [JSON.stringify([sortMetric, !sortAscending])];
-    }
   });
 
   const groupByFormData = applyChartSpecificGroupBy(
@@ -386,10 +401,6 @@ function processGroupByCustomizations(
     existingGroupBy,
     xAxisColumn,
   );
-
-  if (orderByConfig) {
-    groupByFormData.order_by_cols = orderByConfig;
-  }
 
   return groupByFormData;
 }
@@ -463,7 +474,7 @@ export default function getFormDataWithExtraFilters({
 
   let extraData: JsonObject = {};
   const filterIdsAppliedOnChart = Object.entries(activeFilters)
-    .filter(([, activeFilter]) => activeFilter.scope.includes(chart.id))
+    .filter(([, activeFilter]) => activeFilter?.scope?.includes(chart.id))
     .map(([filterId]) => filterId);
 
   if (filterIdsAppliedOnChart.length) {
@@ -478,7 +489,7 @@ export default function getFormDataWithExtraFilters({
     const isDeckMultiChart = chart.form_data?.viz_type === 'deck_multi';
     const hasLayerScopeInActiveFilters =
       passedActiveFilters &&
-      Object.values(passedActiveFilters).some(filter => filter.layerScope);
+      Object.values(passedActiveFilters).some(filter => filter?.layerScope);
 
     if (isDeckMultiChart || hasLayerScopeInActiveFilters) {
       const filterDataMapping = createFilterDataMapping(

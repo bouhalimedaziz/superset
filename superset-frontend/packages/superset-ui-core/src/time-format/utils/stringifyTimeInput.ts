@@ -18,12 +18,29 @@
  */
 
 export default function stringifyTimeInput(
-  value: Date | number | undefined | null,
+  value: Date | number | string | undefined | null,
   fn: (time: Date) => string,
 ) {
   if (value === null || value === undefined) {
     return `${value}`;
   }
 
-  return fn(value instanceof Date ? value : new Date(value));
+  let time: Date;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    const isIntegerString = /^-?\d+$/.test(trimmed);
+    time = new Date(isIntegerString ? Number(trimmed) : value);
+  } else {
+    time = value instanceof Date ? value : new Date(value);
+  }
+
+  // An input that does not resolve to a valid date - a duration such as
+  // "00:01:54", for instance - would otherwise be formatted from an Invalid
+  // Date and render as "NaN:NaN:NaN". Fall back to its own representation,
+  // as is already done for null and undefined above.
+  if (Number.isNaN(time.getTime())) {
+    return `${value}`;
+  }
+
+  return fn(time);
 }
